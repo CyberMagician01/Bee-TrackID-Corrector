@@ -1,0 +1,7 @@
+{
+  "default_folder": "",
+  "reference_mode": "候选ID最后出现",
+  "show_class_names": false,
+  "raw_video_root": "原视频",
+  "motion_marker_radius": 4
+}
