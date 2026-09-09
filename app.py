@@ -33,6 +33,7 @@ from trackid_core import (
     event_signature,
     find_occurrence,
     last_occurrence_before,
+    new_id_queue_status,
     point_in_rect,
     rect_area,
     rect_center,
@@ -86,7 +87,7 @@ REFERENCE_FIRST = "第一帧同位置"
 REFERENCE_PREVIOUS = "上一帧同位置"
 REFERENCE_CANDIDATE = "候选ID最后出现"
 MODE_NEW_ID = "新 ID 纠正"
-MODE_TRAJECTORY = "室外轨迹复查"
+MODE_TRAJECTORY = "轨迹复查（室内/室外）"
 TRAJECTORY_FILTER_ALL = "全部"
 TRAJECTORY_FILTER_PENDING = "未检查"
 TRAJECTORY_FILTER_SUSPICIOUS = "疑似异常"
@@ -152,8 +153,9 @@ class TrackIdCorrector:
         self.trajectory_metrics: dict[int, TrackMetrics] = {}
         self.trajectory_reviews: dict[str, str] = {}
         self.deferred_new_ids: set[int] = set()
-        self.outdoor_new_id_handoff = False
+        self.trajectory_new_id_handoff = False
         self.event_index = -1
+        self.empty_queue_notice = ""
         self.display_frame_index = 0
         self.candidates: list[Candidate] = []
         self.backup_path: Path | None = None
@@ -338,7 +340,7 @@ class TrackIdCorrector:
             textvariable=self.work_mode_var,
             values=[MODE_NEW_ID, MODE_TRAJECTORY],
             state="readonly",
-            width=13,
+            width=20,
         )
         self.work_mode_combo.pack(side=tk.LEFT, padx=2)
         self.work_mode_combo.bind(
@@ -580,11 +582,11 @@ class TrackIdCorrector:
     def _is_trajectory_mode(self) -> bool:
         return self.work_mode_var.get() == MODE_TRAJECTORY
 
-    def _outdoor_sections(self) -> list[Path]:
+    def _trajectory_sections(self) -> list[Path]:
         return [
             section
             for section in self.all_section_dirs
-            if section.name.upper().startswith("A-")
+            if section.name.upper().startswith(("A-", "B-"))
         ]
 
     def _update_mode_ui(self) -> None:
@@ -656,7 +658,7 @@ class TrackIdCorrector:
                 timeline_parent.pack_forget()
 
     def _on_work_mode_changed(self, _event=None) -> None:
-        self.outdoor_new_id_handoff = False
+        self.trajectory_new_id_handoff = False
         self._stop_motion()
         if self._is_trajectory_mode():
             self.trajectory_filter_var.set(TRAJECTORY_FILTER_PENDING)
@@ -664,14 +666,14 @@ class TrackIdCorrector:
         if not self.all_section_dirs:
             return
         sections = (
-            self._outdoor_sections()
+            self._trajectory_sections()
             if self._is_trajectory_mode()
             else list(self.all_section_dirs)
         )
         if not sections:
             messagebox.showwarning(
-                "没有室外区段",
-                "当前任务目录中没有名称以 A- 开头的室外区段。",
+                "没有可复查区段",
+                "当前任务目录中没有名称以 A- 或 B- 开头的区段。",
             )
             self.work_mode_var.set(MODE_NEW_ID)
             self._update_mode_ui()
@@ -687,7 +689,7 @@ class TrackIdCorrector:
         self._update_mode_ui()
 
     def load_task(self, selected: Path) -> None:
-        self.outdoor_new_id_handoff = False
+        self.trajectory_new_id_handoff = False
         if self._is_trajectory_mode():
             self.trajectory_filter_var.set(TRAJECTORY_FILTER_PENDING)
         selected = selected.resolve()
@@ -711,7 +713,7 @@ class TrackIdCorrector:
         self.task_root = task_root
         self.all_section_dirs = sections
         self.section_dirs = (
-            self._outdoor_sections()
+            self._trajectory_sections()
             if self._is_trajectory_mode()
             else list(sections)
         )
@@ -747,6 +749,7 @@ class TrackIdCorrector:
         self.section = section
         self.images = images
         self.documents = documents
+        self.display_frame_index = 0
         self._update_reference_choices()
         self.reviewed = load_reviewed(section)
         self.trajectory_reviews = load_trajectory_reviews(section)
@@ -756,7 +759,10 @@ class TrackIdCorrector:
         if clear_undo:
             self.undo_stack.clear()
         self._rebuild_queue(preferred_index=0)
-        self.status_var.set(f"已加载：{section}")
+        loaded_status = f"已加载：{section}"
+        if self.empty_queue_notice:
+            loaded_status += f"  |  {self.empty_queue_notice}"
+        self.status_var.set(loaded_status)
         self.backup_var.set("尚未修改")
 
     def _reload_from_disk(self) -> None:
@@ -777,11 +783,17 @@ class TrackIdCorrector:
 
     def _rebuild_new_id_queue(self, preferred_index: int = 0) -> None:
         self.tracks = build_tracks(self.documents)
+        queue_status = new_id_queue_status(
+            self.documents,
+            [image.name for image in self.images],
+            self.reviewed,
+            self.deferred_new_ids if self.trajectory_new_id_handoff else None,
+        )
         self.events = review_events(
             self.documents,
             [image.name for image in self.images],
             self.reviewed,
-            self.deferred_new_ids if self.outdoor_new_id_handoff else None,
+            self.deferred_new_ids if self.trajectory_new_id_handoff else None,
         )
         values = [
             f"第 {event.first_frame_index + 1} 张 | 新 ID {event.track_id}"
@@ -789,12 +801,36 @@ class TrackIdCorrector:
         ]
         self.event_combo["values"] = values
         if self.events:
+            self.empty_queue_notice = ""
             self.event_index = min(max(0, preferred_index), len(self.events) - 1)
             self.event_var.set(values[self.event_index])
             self._activate_event()
         else:
             self.event_index = -1
-            self.event_var.set("全部审核完成")
+            labels = {
+                "no_tracks": "未找到有效 Track ID",
+                "no_later_ids": "没有后续新 ID",
+                "complete": "全部审核完成",
+            }
+            notices = {
+                "no_tracks": (
+                    "未找到有效 Track ID：JSON 中的蜜蜂矩形框需包含"
+                    "大于 0 的整数 group_id"
+                ),
+                "no_later_ids": (
+                    "所有有效 ID 均从第一张出现，可切换到轨迹复查"
+                ),
+                "complete": (
+                    "新 ID 已全部审核完成，图片仍可浏览或切换到轨迹复查"
+                ),
+            }
+            self.event_var.set(labels.get(queue_status, "当前没有待审核新 ID"))
+            self.empty_queue_notice = notices.get(
+                queue_status, "当前没有待审核新 ID"
+            )
+            self.display_frame_index = min(
+                max(0, self.display_frame_index), len(self.images) - 1
+            )
             self.candidates = []
             self.old_id_var.set("")
             self._fill_candidates()
@@ -936,6 +972,7 @@ class TrackIdCorrector:
         values = [self._trajectory_event_text(event) for event in self.events]
         self.event_combo["values"] = values
         if self.events:
+            self.empty_queue_notice = ""
             if active_track_id is None:
                 self.event_index = min(
                     max(0, preferred_index), len(self.events) - 1
@@ -962,7 +999,14 @@ class TrackIdCorrector:
                 self._fill_candidates()
         else:
             self.event_index = -1
-            self.event_var.set("当前筛选条件下没有轨迹")
+            if self.trajectory_all_events:
+                self.empty_queue_notice = "当前筛选条件下没有轨迹"
+            else:
+                self.empty_queue_notice = (
+                    "未找到有效 Track ID：JSON 中的蜜蜂矩形框需包含"
+                    "大于 0 的整数 group_id"
+                )
+            self.event_var.set(self.empty_queue_notice)
             self.candidates = []
             self.old_id_var.set("")
             self._fill_candidates()
@@ -998,7 +1042,7 @@ class TrackIdCorrector:
             self.documents,
             [image.name for image in self.images],
             self.reviewed,
-            self.deferred_new_ids if self.outdoor_new_id_handoff else None,
+            self.deferred_new_ids if self.trajectory_new_id_handoff else None,
         )
         values = [
             f"第 {event.first_frame_index + 1} 张 | 新 ID {event.track_id}"
@@ -1145,17 +1189,17 @@ class TrackIdCorrector:
                 self._activate_event()
                 return True
             target_index += direction
-        if direction > 0 and self._all_outdoor_trajectories_reviewed():
-            return self._begin_outdoor_new_id_handoff()
+        if direction > 0 and self._all_trajectories_reviewed():
+            return self._begin_trajectory_new_id_handoff()
         self.status_var.set(
-            "已经是最后一个室外区段"
+            "已经是最后一个轨迹复查区段"
             if direction > 0
-            else "已经是第一个室外区段"
+            else "已经是第一个轨迹复查区段"
         )
         return False
 
-    def _all_outdoor_trajectories_reviewed(self) -> bool:
-        sections = self._outdoor_sections()
+    def _all_trajectories_reviewed(self) -> bool:
+        sections = self._trajectory_sections()
         if not sections:
             return False
         try:
@@ -1177,13 +1221,13 @@ class TrackIdCorrector:
             return False
         return True
 
-    def _begin_outdoor_new_id_handoff(self) -> bool:
-        sections = self._outdoor_sections()
+    def _begin_trajectory_new_id_handoff(self) -> bool:
+        sections = self._trajectory_sections()
         if not sections:
             return False
         self._stop_motion()
         self.work_mode_var.set(MODE_NEW_ID)
-        self.outdoor_new_id_handoff = True
+        self.trajectory_new_id_handoff = True
         self.section_dirs = sections
         self.section_combo["values"] = [path.name for path in sections]
         self._update_mode_ui()
@@ -1192,17 +1236,17 @@ class TrackIdCorrector:
             self._load_section(section, clear_undo=True)
             if self.events:
                 self.status_var.set(
-                    "室外轨迹已全部复查完成；"
+                    "室内/室外轨迹已全部复查完成；"
                     f"开始审核 {section.name} 的待处理新 ID"
                 )
                 return True
-        self.outdoor_new_id_handoff = False
-        self.status_var.set("室外轨迹已全部复查完成，没有待审核的新 ID")
+        self.trajectory_new_id_handoff = False
+        self.status_var.set("室内/室外轨迹已全部复查完成，没有待审核的新 ID")
         return True
 
-    def _advance_outdoor_new_id_section(self) -> bool:
+    def _advance_trajectory_new_id_section(self) -> bool:
         if (
-            not self.outdoor_new_id_handoff
+            not self.trajectory_new_id_handoff
             or self.section not in self.section_dirs
         ):
             return False
@@ -1215,8 +1259,8 @@ class TrackIdCorrector:
                     f"继续审核 {section.name} 的待处理新 ID"
                 )
                 return True
-        self.outdoor_new_id_handoff = False
-        self.status_var.set("所有室外新增 ID 已审核完成")
+        self.trajectory_new_id_handoff = False
+        self.status_var.set("所有轨迹复查产生的新增 ID 已审核完成")
         return True
 
     def previous_trajectory(self) -> None:
@@ -1418,7 +1462,7 @@ class TrackIdCorrector:
             return
         snapshot = snapshot_files(self.section, self.images)
         self.reviewed.add(event.signature)
-        if self.outdoor_new_id_handoff:
+        if self.trajectory_new_id_handoff:
             self.deferred_new_ids.discard(event.track_id)
             save_deferred_new_ids(self.section, self.deferred_new_ids)
         save_reviewed(self.section, self.reviewed)
@@ -1427,7 +1471,7 @@ class TrackIdCorrector:
         self.status_var.set(f"已确认 ID {event.track_id} 是新目标")
         self._rebuild_queue(preferred_index=old_index)
         if not self.events:
-            self._advance_outdoor_new_id_section()
+            self._advance_trajectory_new_id_section()
 
     def merge_current(self) -> None:
         if self._is_trajectory_mode():
@@ -1524,7 +1568,7 @@ class TrackIdCorrector:
                 remap_document(document, old_id, new_id)
                 for document in self.documents
             )
-            if self.outdoor_new_id_handoff:
+            if self.trajectory_new_id_handoff:
                 self.deferred_new_ids = {
                     track_id - 1 if track_id > new_id else track_id
                     for track_id in self.deferred_new_ids
@@ -1567,7 +1611,7 @@ class TrackIdCorrector:
             )
         self._rebuild_queue(preferred_index=old_index)
         if not self.events:
-            self._advance_outdoor_new_id_section()
+            self._advance_trajectory_new_id_section()
 
     def undo(self) -> None:
         if not self.undo_stack:
@@ -2083,7 +2127,25 @@ class TrackIdCorrector:
         canvas = self.current_canvas
         canvas.delete("all")
         event = self.current_event()
-        if not self.images or not event:
+        if not self.images:
+            return
+        if event is None:
+            frame_index = min(
+                max(0, self.display_frame_index), len(self.images) - 1
+            )
+            image = self._get_image(frame_index)
+            self._draw_boxes(image, frame_index, None)
+            resized, _scale, x, y = self._fit_to_canvas(canvas, image)
+            self.current_photo = ImageTk.PhotoImage(resized)
+            canvas.create_image(x, y, image=self.current_photo, anchor=tk.NW)
+            canvas.create_text(
+                12,
+                12,
+                text=self.empty_queue_notice,
+                fill="#ffd166",
+                anchor=tk.NW,
+                font=("Microsoft YaHei UI", 11, "bold"),
+            )
             return
         occurrence = find_occurrence(
             self.tracks, event.track_id, self.display_frame_index
@@ -4961,7 +5023,28 @@ class TrackIdCorrector:
         canvas = self.reference_canvas
         canvas.delete("all")
         event = self.current_event()
-        if not self.images or not event:
+        if not self.images:
+            self.reference_transform = None
+            return
+        if event is None:
+            frame_index = min(
+                max(0, self.reference_frame_index), len(self.images) - 1
+            )
+            image = self._get_image(frame_index)
+            self._draw_boxes(image, frame_index, None)
+            resized, scale, x, y = self._fit_to_canvas(canvas, image)
+            self.reference_photo = ImageTk.PhotoImage(resized)
+            canvas.create_image(x, y, image=self.reference_photo, anchor=tk.NW)
+            crop = (0, 0, image.width, image.height)
+            self.reference_transform = (scale, x, y, crop)
+            canvas.create_text(
+                10,
+                10,
+                text=f"参考第 {frame_index + 1} 张",
+                fill="white",
+                anchor=tk.NW,
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
             return
         frame_index, focus_rect, selected_old = self._reference_spec(event)
         image = self._get_image(frame_index)
@@ -4994,6 +5077,11 @@ class TrackIdCorrector:
             self.frame_var.set(
                 f"当前第 {self.display_frame_index + 1}/{len(self.images)} 张"
                 f"    审核新 ID：{event.track_id}"
+            )
+        elif self.images:
+            self.frame_var.set(
+                f"当前第 {self.display_frame_index + 1}/{len(self.images)} 张"
+                f"    {self.empty_queue_notice}"
             )
         else:
             self.frame_var.set("")
@@ -5102,9 +5190,10 @@ class TrackIdCorrector:
 8. 如果确实是新蜜蜂，按 V 保留。
 9. 按 G 可单独打开当前帧的全局鸟瞰图。
 
-室外轨迹复查
+室内/室外轨迹复查
 
-• 在顶部“模式”中选择“室外轨迹复查”，软件只列出名称以 A- 开头的室外区段。
+• 在顶部“模式”中选择“轨迹复查（室内/室外）”，软件会列出名称以 A- 或 B- 开头的区段。
+• A- 为室外自然光，B- 为室内红外；两类数据使用同一套逐 ID 复查流程。
 • 每个 Track ID 都会进入复查队列，包括从第一帧就已出现的 ID。
 • 软件默认只显示“未检查”轨迹；重新打开任务时会自动进入当前区段第一个未检查 ID。
 • 每次按 Space 标记通过或按 M 标记有问题后都会立即保存审核进度。
@@ -5113,11 +5202,11 @@ class TrackIdCorrector:
 • 下方时间轴可点击任意帧；绿色表示该 ID 存在，灰色表示缺失，红边表示规则检测到疑似异常。
 • 可按“全部、未检查、疑似异常、有问题”筛选轨迹。
 • 确认轨迹正确后按 Space 标记通过；需要后续处理时按 M 标记有问题。
-• J / K 切换上一条 / 下一条轨迹，走到区段末尾后会自动进入下一个室外区段。
+• J / K 切换上一条 / 下一条轨迹，走到区段末尾后会自动进入下一个 A/B 区段。
 • 复查结果保存在各区段的 .trackid_trajectory_review.json，不修改原标注格式。
 • 如果移动、缩放、添加、删除或改 ID，受影响轨迹会自动恢复为“未检查”。
 • 轨迹复查模式仍保留 Ctrl 编辑框、右键改 ID/删除/拆分、R 添加框和 Ctrl+Z 撤销。
-• 复查时新建或手动改出的末尾 ID 会进入延后队列；所有 A 类轨迹复查完成后，软件会自动切换到“新 ID 纠正”，并按 A 类区段继续审核这些 ID。
+• 复查时新建或手动改出的末尾 ID 会进入延后队列；所有 A/B 轨迹复查完成后，软件会自动切换到“新 ID 纠正”，并继续审核这些 ID。
 
 全局鸟瞰
 
@@ -5190,9 +5279,9 @@ Ctrl+O       打开目录
 F1           帮助
 P            打开独立运动窗口 / 播放 / 暂停
 G            打开全局鸟瞰图
-J / K        上一条 / 下一条室外复查轨迹
-Space        室外轨迹标记为通过
-M            室外轨迹标记为有问题
+J / K        上一条 / 下一条室内或室外复查轨迹
+Space        当前轨迹标记为通过
+M            当前轨迹标记为有问题
 
 局部运动窗口专用
 

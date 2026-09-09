@@ -120,6 +120,27 @@ def review_events(
     return sorted(events, key=lambda item: (item.first_frame_index, item.track_id))
 
 
+def new_id_queue_status(
+    documents: list[dict],
+    image_names: list[str],
+    reviewed_signatures: set[str] | None = None,
+    forced_track_ids: set[int] | None = None,
+) -> str:
+    """说明新 ID 队列为空或仍有任务的原因。"""
+    if not build_tracks(documents):
+        return "no_tracks"
+    if review_events(
+        documents,
+        image_names,
+        reviewed_signatures,
+        forced_track_ids,
+    ):
+        return "pending"
+    if review_events(documents, image_names, set(), forced_track_ids):
+        return "complete"
+    return "no_later_ids"
+
+
 def trajectory_review_events(
     documents: list[dict],
     image_names: list[str],

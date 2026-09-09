@@ -9,6 +9,7 @@ from trackid_core import (
     collision_frames,
     delete_occurrence_with_points,
     displace_id_on_frames,
+    new_id_queue_status,
     remap_document,
     review_events,
     split_track_from_frame,
@@ -73,6 +74,26 @@ def test_forced_new_id_is_reviewed_even_on_first_frame_or_already_reviewed():
 
     assert [event.track_id for event in events] == [9]
     assert events[0].first_frame_index == 0
+
+
+def test_new_id_queue_status_explains_empty_queue():
+    image_names = ["f0.jpg", "f1.jpg"]
+
+    assert new_id_queue_status([{"shapes": []}, {"shapes": []}], image_names) == "no_tracks"
+
+    first_frame_only = [
+        {"shapes": [rectangle(1, 0)]},
+        {"shapes": [rectangle(1, 2)]},
+    ]
+    assert new_id_queue_status(first_frame_only, image_names) == "no_later_ids"
+
+    later_id = [
+        {"shapes": [rectangle(1, 0)]},
+        {"shapes": [rectangle(1, 2), rectangle(2, 50)]},
+    ]
+    assert new_id_queue_status(later_id, image_names) == "pending"
+    signature = review_events(later_id, image_names)[0].signature
+    assert new_id_queue_status(later_id, image_names, {signature}) == "complete"
 
 
 def test_collision_rejected_by_detection():
